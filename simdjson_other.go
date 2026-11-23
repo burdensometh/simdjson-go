@@ -74,3 +74,20 @@ func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
 	}()
 	return
 }
+
+// ParseNDStreamTolerant is the fault-tolerant variant of ParseNDStream.
+// See the amd64 implementation for the full contract: unparseable lines
+// are delivered to bad as BadLine values while valid records keep
+// flowing to res in their original order, reader errors remain fatal,
+// and both channels are closed once the stream has ended.
+func ParseNDStreamTolerant(r io.Reader, res chan<- Stream, bad chan<- BadLine, reuse <-chan *ParsedJson) {
+	go func() {
+		res <- Stream{
+			Value: nil,
+			Error: fmt.Errorf("Unsupported platform"),
+		}
+		close(res)
+		close(bad)
+	}()
+	return
+}

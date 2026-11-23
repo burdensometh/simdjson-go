@@ -270,6 +270,59 @@ func findHondas(r io.Reader) {
 
 More examples can be found in the examples subdirectory and further documentation can be found at [godoc](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc).
 
+### Tolerating malformed lines
+
+By default `ParseNDStream` is strict: a single line that cannot be parsed terminates the whole
+stream with an error. When collected NDJSON occasionally contains a bad line (for example a
+missing quote), that can stall every report built from the same batch.
+
+`ParseNDStreamTolerant` adds an explicit fault-tolerant mode. It takes an extra quarantine
+channel that receives a `BadLine` for every line that fails to parse; valid records keep
+flowing on the result channel and the original order is preserved.
+
+```Go
+func processTolerant(r io.Reader) error {
+	reuse := make(chan *simdjson.ParsedJson, 10)
+	res := make(chan simdjson.Stream, 10)
+	bad := make(chan simdjson.BadLine, 10)
+
+	simdjson.ParseNDStreamTolerant(r, res, bad, reuse)
+	for {
+		select {
+		case got, ok := <-res:
+			if !ok {
+				return nil // both channels are closed when the stream ends
+			}
+			if got.Error != nil {
+				if got.Error == io.EOF {
+					continue
+				}
+				// A reader error is still fatal; chunks already parsed
+				// have been forwarded before this point.
+				return got.Error
+			}
+			// ... process got.Value as in the strict example ...
+			reuse <- got.Value
+		case line := <-bad:
+			// line.Line is the 1-based line number within the whole input,
+			// line.Raw is a copy of the original line and line.Err the
+			// parse error. Hand it to a quarantine/dead-letter sink.
+			log.Printf("quarantine line %d: %v", line.Line, line.Err)
+		}
+	}
+}
+```
+
+Properties of the tolerant mode:
+
+- A chunk that parses cleanly takes the same fast bulk path as `ParseNDStream`; the
+  line-by-line fallback only runs for chunks that contain a parse failure.
+- Each `BadLine` carries the 1-based global line number (continuous across internal read
+  chunks), a copy of the raw line and the parse error.
+- Valid results and quarantine events are forwarded in input order, so the line numbers
+  allow the original stream to be reconstructed.
+- Failures of the underlying reader remain fatal: all chunks parsed up to that point are
+  forwarded first, then the reader error is delivered and both channels are closed.
 
 ### In-place Value Replacement
 
