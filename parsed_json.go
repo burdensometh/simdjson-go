@@ -66,6 +66,11 @@ type ParsedJson struct {
 	Tape    []uint64
 	Strings *TStrings
 
+	// activeParser records the implementation that produced the tape.
+	// It is kept on the value itself so that it survives the value copies
+	// performed when streaming parsed JSON back to callers.
+	activeParser Parser
+
 	// allows to reuse the internal structures without exposing it.
 	internal *internalParsedJson
 }
@@ -90,6 +95,18 @@ type internalParsedJson struct {
 	buffersOffset         uint64
 	ndjson                uint64
 	copyStrings           bool
+	// parser records the implementation requested via WithParser.
+	// It is resolved to either ParserSIMD or ParserGo before parsing.
+	parser Parser
+}
+
+// Parser returns the implementation that produced the parsed JSON.
+// It returns ParserSIMD when the SIMD/assembly stage was used and
+// ParserGo when the portable pure Go fallback was used.
+// A zero value ParsedJson that has not been returned by Parse/ParseND
+// reports ParserAuto.
+func (pj *ParsedJson) Parser() Parser {
+	return pj.activeParser
 }
 
 // Iter returns a new Iter.

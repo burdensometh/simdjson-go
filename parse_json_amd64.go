@@ -123,5 +123,6 @@ func (pj *internalParsedJson) parseMessage(msg []byte, ndjson bool) (err error) 
 	if errStage1 != nil {
 		return errStage1
 	}
+	pj.activeParser = ParserSIMD
 	return
 }

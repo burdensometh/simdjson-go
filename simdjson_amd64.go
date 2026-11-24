@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"sync"
 
 	"github.com/klauspost/cpuid/v2"
 )
@@ -39,9 +38,6 @@ func SupportedCPU() bool {
 }
 
 func newInternalParsedJson(reuse *ParsedJson, opts []ParserOption) (*internalParsedJson, error) {
-	if !SupportedCPU() {
-		return nil, errors.New("Host CPU does not meet target specs")
-	}
 	var pj *internalParsedJson
 	if reuse != nil && reuse.internal != nil {
 		pj = reuse.internal
@@ -53,9 +49,27 @@ func newInternalParsedJson(reuse *ParsedJson, opts []ParserOption) (*internalPar
 		pj = &internalParsedJson{}
 	}
 	pj.copyStrings = true
+	// Reset parser selection so a reused ParsedJson cannot leak a previous
+	// WithParser choice; ParserAuto is the documented default.
+	pj.parser = ParserAuto
 	for _, opt := range opts {
 		if err := opt(pj); err != nil {
 			return nil, err
+		}
+	}
+	// Resolve the requested implementation against CPU capabilities.
+	switch pj.parser {
+	case ParserGo:
+		// Explicitly requested portable parser; no CPU requirement.
+	case ParserSIMD:
+		if !SupportedCPU() {
+			return nil, errors.New("Host CPU does not meet target specs")
+		}
+	default: // ParserAuto
+		if SupportedCPU() {
+			pj.parser = ParserSIMD
+		} else {
+			pj.parser = ParserGo
 		}
 	}
 	return pj, nil
@@ -68,6 +82,15 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 	if err != nil {
 		return nil, err
 	}
+	if pj.parser == ParserGo {
+		if err = pj.parseMessagePortable(b, false); err != nil {
+			return nil, err
+		}
+		parsed := &pj.ParsedJson
+		parsed.internal = pj
+		return parsed, nil
+	}
+	pj.activeParser = ParserSIMD
 	err = pj.parseMessage(b, false)
 	if err != nil {
 		return nil, err
@@ -84,6 +107,13 @@ func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, er
 	if err != nil {
 		return nil, err
 	}
+	if pj.parser == ParserGo {
+		if err = pj.parseMessagePortable(bytes.TrimSpace(b), true); err != nil {
+			return nil, err
+		}
+		return &pj.ParsedJson, nil
+	}
+	pj.activeParser = ParserSIMD
 	err = pj.parseMessage(bytes.TrimSpace(b), true)
 	if err != nil {
 		return nil, err
@@ -113,8 +143,30 @@ type Stream struct {
 // An optional channel for returning consumed results can be provided.
 // There is no guarantee that elements will be consumed, so always use
 // non-blocking writes to the reuse channel.
-func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
-	if !SupportedCPU() {
+func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson, opts ...ParserOption) {
+	// Resolve the requested implementation against CPU capabilities.
+	selected := ParserAuto
+	copyStrings := true
+	var tmp internalParsedJson
+	for _, opt := range opts {
+		if err := opt(&tmp); err != nil {
+			go func() {
+				res <- Stream{Error: err}
+				close(res)
+			}()
+			return
+		}
+	}
+	selected = tmp.parser
+	copyStrings = tmp.copyStrings
+	if selected == ParserAuto {
+		if SupportedCPU() {
+			selected = ParserSIMD
+		} else {
+			selected = ParserGo
+		}
+	}
+	if selected == ParserSIMD && !SupportedCPU() {
 		go func() {
 			res <- Stream{
 				Value: nil,
@@ -126,9 +178,11 @@ func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
 	}
 	const tmpSize = 10 << 20
 	buf := bufio.NewReaderSize(r, tmpSize)
-	tmpPool := sync.Pool{New: func() interface{} {
-		return make([]byte, tmpSize+1024)
-	}}
+	tmpPool := bufferPool()
+	if selected == ParserGo {
+		parseNDStreamPortable(buf, res, reuse, copyStrings, tmpSize, tmpPool)
+		return
+	}
 	conc := (runtime.GOMAXPROCS(0) + 1) / 2
 	queue := make(chan chan Stream, conc)
 	go func() {
@@ -178,7 +232,8 @@ func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
 				queue <- result
 				go func() {
 					var pj internalParsedJson
-					pj.copyStrings = true
+					pj.copyStrings = copyStrings
+					pj.activeParser = ParserSIMD
 					select {
 					case v := <-reuse:
 						if cap(v.Message) >= tmpSize+1024 {

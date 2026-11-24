@@ -34,9 +34,40 @@ Additionally `simdjson-go` has the following features:
 A CPU with both AVX2 and CLMUL is required (Haswell from 2013 onwards should do for Intel, for AMD a Ryzen/EPYC CPU (Q1 2017) should be sufficient).
 This can be checked using the provided [`SupportedCPU()`](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc#SupportedCPU) function.
 
-The package does not provide fallback for unsupported CPUs, but serialized data can be deserialized on an unsupported CPU.
+A portable, pure Go parser is included for CPUs without AVX2/CLMUL support and for
+builds where the assembly implementation is disabled (`appengine`, `gccgo` or the
+`noasm` build tag). It emits exactly the same tape, string buffer and number tags as
+the SIMD implementation, so iteration, projection and serialization behave identically.
+Serialized data can always be deserialized on an unsupported CPU.
 
-Using the `gccgo` will also always return unsupported CPU since it cannot compile assembly.
+### Selecting a parser
+
+Use the `WithParser` option to choose the parsing implementation:
+
+```Go
+// Auto (the default): SIMD when the CPU supports it, otherwise the portable parser.
+pj, err := Parse(data, nil)
+
+// Force the portable pure Go parser on any architecture.
+pj, err = Parse(data, nil, WithParser(ParserGo))
+
+// Force the SIMD parser; returns an error on an unsupported CPU.
+pj, err = Parse(data, nil, WithParser(ParserSIMD))
+```
+
+The implementation that actually produced a `ParsedJson` can be reported back:
+
+```Go
+fmt.Println("parsed with path:", pj.Parser()) // "simd" or "go"
+```
+
+`ParserAuto` keeps the historical behaviour on supported machines while allowing the
+same log import program to run unchanged and produce identical records, null values and
+exact integers on machines without SIMD. The selection applies to `Parse`, `ParseND`
+and `ParseNDStream`.
+
+Using the `gccgo` will also always return unsupported CPU since it cannot compile assembly;
+parsing then goes through the portable implementation unless `ParserSIMD` is forced.
 
 ## Usage
 
