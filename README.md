@@ -166,6 +166,77 @@ Will locate the field inside a json object with the following structure:
 The values can be any type. The [Element](https://pkg.go.dev/github.com/minio/simdjson-go#Element)
 will contain the element information and an Iter to access the content.
 
+## Allowlist projection
+
+When publishing excerpts of parsed records it is often required that only
+explicitly approved paths are allowed in the output. A `PathAllowlist`
+projects a parsed JSON document into new JSON containing nothing but the
+approved paths:
+
+```go
+// Approved paths. Slash separated; an all-digit segment is a zero-based
+// array index, any other segment is an object member name.
+approved := []string{
+    "txn_id",
+    "counterparty/name",
+    "amount/currency",
+    "line_items/0/sku",
+}
+
+// Build-time issues point back at the configuration entry by index,
+// so duplicate and syntactically invalid paths can be located.
+allowlist, buildIssues := simdjson.ParseAllowlistPaths(approved)
+
+pj, err := simdjson.Parse(msg, nil)
+if err != nil { /* handle */ }
+
+// Project writes fresh JSON and leaves the parsed record untouched.
+published, dataIssues, err := allowlist.Project(pj)
+```
+
+For input
+
+```json
+{
+    "txn_id": "TX-1001",
+    "counterparty": {"name": "Acme Corp", "internal_note": "secret"},
+    "amount": {"value": 1250.75, "currency": "EUR"},
+    "line_items": [{"sku": "A-1", "cost": 10.5}, {"sku": "B-2"}],
+    "fraud_score": 0.03
+}
+```
+
+the projection is
+
+```json
+{"txn_id":"TX-1001","counterparty":{"name":"Acme Corp"},"amount":{"currency":"EUR"},"line_items":[{"sku":"A-1"}]}
+```
+
+Properties:
+
+* The parsed JSON is read only. Its tape, message and string buffer are not
+  modified, so the original record stays available for comparison.
+* Object member relationships, member order and array element order are
+  preserved. Sibling members and array elements that no approved path reaches
+  are omitted; empty containers collapse out of the output.
+* A path ending at an object or array approves that whole subtree. Descendant
+  paths below it are redundant, not invalid.
+* NDJSON input produces one output line per input record, in order.
+* A single allowlist can be reused for many projections, but one instance must
+  not be used concurrently.
+
+Every problem is returned as a `PathIssue` located by the zero-based
+configuration index (`PathIssue.Index`) and, for data-level problems, the
+zero-based segment that failed (`PathIssue.Segment`):
+
+* `IssueDuplicate` — the exact same path appears more than once.
+* `IssueInvalid` — empty path or empty segment, a path that cannot be found,
+  an object/array type mismatch, an array index out of range, or a path that
+  continues past a scalar value.
+
+A projection is still produced from whatever matched; the returned error is
+non-nil only when the tape itself cannot be traversed.
+
 ## Parsing Objects
 
 If you are only interested in one key in an object you can use `FindKey` to quickly select it.
