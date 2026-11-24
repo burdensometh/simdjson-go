@@ -270,6 +270,35 @@ func findHondas(r io.Reader) {
 
 More examples can be found in the examples subdirectory and further documentation can be found at [godoc](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc).
 
+### Merging per-order updates
+
+The `orderledger` subpackage builds on parsed results to select the final
+version of each order from a batch of updates. See `orderledger/doc.go` for
+the full rules.
+
+```Go
+ledger := orderledger.New(orderledger.Config{})
+res, err := ledger.IngestParsed(pj) // or ledger.IngestJSON(batch)
+if err != nil {
+	log.Fatal(err)
+}
+for _, final := range res.Final {
+	// final.Key, final.Version and final.Raw hold the event to upload.
+}
+for _, conflict := range res.Conflicts {
+	// Same key and version with different values: send to reconciliation.
+}
+```
+
+Records are merged by order key and by version order, not arrival order. A
+redelivery of a value already seen is counted in `res.Duplicates` and does not
+create a new version. Lower versions are retained through `Entry.Superseded()`
+together with the values they carried. A version delivered with two different
+values is reported in `res.Conflicts`; if it is the highest version, the order
+has no `Entry.FinalEvent()` until it is reconciled. The ledger is stateful, so
+a later batch with an older version does not roll the final event back.
+
+
 
 ### In-place Value Replacement
 
