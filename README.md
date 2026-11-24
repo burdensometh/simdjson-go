@@ -557,6 +557,27 @@ BenchmarkUpdate_center/copy-32                	    1665	    708717 ns/op	 752.31
 BenchmarkUpdate_center/nocopy-32              	    2241	    536027 ns/op	 994.68 MB/s	    2130 B/op	      58 allocs/op
 ```
 
+### Duplicate keys
+
+JSON objects may contain the same key more than once in a single object
+(for instance when a supplier sends both an old and a new value).
+By default all occurrences are kept, which means lookups do not agree:
+`FindKey`/`FindPath` return the first occurrence, `Map`/`Elements` the last,
+and marshaled output contains all of them.
+
+The `WithDuplicateKeyPolicy` parse option declares how duplicates within
+each object are resolved when the JSON is ingested:
+
+```Go
+pj, err := simdjson.Parse(input, nil, simdjson.WithDuplicateKeyPolicy(simdjson.DuplicateKeyKeepLast))
+```
+
+Available policies are `DuplicateKeyKeepFirst`, `DuplicateKeyKeepLast`
+and `DuplicateKeyReject` (which fails parsing with a `*DuplicateKeyError`).
+The policy is applied to the parsed result, so all lookups and all output
+observe the same value. Scopes are independent: the same key in different
+(nested) objects is not considered a duplicate.
+
 ## Design
 
 `simdjson-go` follows the same two stage design as `simdjson`.

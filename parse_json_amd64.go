@@ -117,11 +117,18 @@ func (pj *internalParsedJson) parseMessage(msg []byte, ndjson bool) (err error) 
 				}
 			}
 		}
-		return nil
 	}
 
 	if errStage1 != nil {
 		return errStage1
 	}
-	return
+	if err != nil {
+		return err
+	}
+	if pj.duplicateKeyPolicy != DuplicateKeyKeepAll {
+		if err := pj.ParsedJson.applyDuplicateKeyPolicy(pj.duplicateKeyPolicy); err != nil {
+			return err
+		}
+	}
+	return nil
 }

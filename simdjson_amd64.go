@@ -53,6 +53,7 @@ func newInternalParsedJson(reuse *ParsedJson, opts []ParserOption) (*internalPar
 		pj = &internalParsedJson{}
 	}
 	pj.copyStrings = true
+	pj.duplicateKeyPolicy = DuplicateKeyKeepAll
 	for _, opt := range opts {
 		if err := opt(pj); err != nil {
 			return nil, err

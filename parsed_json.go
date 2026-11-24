@@ -90,6 +90,7 @@ type internalParsedJson struct {
 	buffersOffset         uint64
 	ndjson                uint64
 	copyStrings           bool
+	duplicateKeyPolicy    DuplicateKeyPolicy
 }
 
 // Iter returns a new Iter.
@@ -205,12 +206,12 @@ func (i *Iter) Advance() Type {
 
 		v := i.tape.Tape[i.off]
 		i.t = Tag(v >> 56)
-		i.off++
 		i.cur = v & JSONVALUEMASK
 		if i.t == TagNop {
 			i.off += int(i.cur)
 			continue
 		}
+		i.off++
 		break
 	}
 	i.calcNext(false)
@@ -305,7 +306,6 @@ func (i *Iter) AdvanceIter(dst *Iter) (Type, error) {
 		v := i.tape.Tape[i.off]
 		i.cur = v & JSONVALUEMASK
 		i.t = Tag(v >> 56)
-		i.off++
 		if i.t == TagNop {
 			if i.cur <= 0 {
 				return TypeNone, errors.New("invalid nop skip")
@@ -313,6 +313,7 @@ func (i *Iter) AdvanceIter(dst *Iter) (Type, error) {
 			i.off += int(i.cur)
 			continue
 		}
+		i.off++
 		break
 	}
 	i.calcNext(false)
