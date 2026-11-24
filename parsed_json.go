@@ -29,6 +29,14 @@ const JSONTAGMASK = 0xff << JSONTAGOFFSET
 const STRINGBUFBIT = 0x80_0000_0000_0000
 const STRINGBUFMASK = 0x7fffffffffffff
 
+// rawNumberBit marks a TagString tape entry whose text is the verbatim lexical
+// representation of a JSON number preserved via WithRawNumbers, rather than a
+// regular JSON string. It lives in a spare bit of the string offset/length
+// payload (offsets never reach this size) and is stripped before the payload
+// is interpreted as a string location.
+const rawNumberBit = 0x40_0000_0000_0000
+const rawNumberMask = JSONVALUEMASK ^ rawNumberBit
+
 const maxdepth = 128
 
 // FloatFlags are flags recorded when converting floats.
@@ -90,6 +98,19 @@ type internalParsedJson struct {
 	buffersOffset         uint64
 	ndjson                uint64
 	copyStrings           bool
+
+	// rawNumberFields holds the object field names whose numeric values must
+	// keep their original lexical text. nil means the feature is disabled.
+	rawNumberFields map[string]struct{}
+
+	// rawNumberCurrentKey is the name of the object field whose value the
+	// state machine is about to parse; empty when no field is being matched.
+	rawNumberCurrentKey string
+
+	// rawNumberArrays records tape indexes of '[' entries that are the value
+	// of a raw-number field (including nested arrays). While non-empty, number
+	// elements inside those arrays keep their lexical text.
+	rawNumberArrays []uint64
 }
 
 // Iter returns a new Iter.
@@ -105,6 +126,8 @@ func (pj *ParsedJson) stringAt(offset, length uint64) (string, error) {
 
 // stringByteAt returns a string at a specific offset in the stringbuffer.
 func (pj *ParsedJson) stringByteAt(offset, length uint64) ([]byte, error) {
+	// A raw-number marker may ride along in the offset payload; drop it.
+	offset &= rawNumberMask
 	if offset&STRINGBUFBIT == 0 {
 		if offset+length > uint64(len(pj.Message)) {
 			return nil, fmt.Errorf("string message offset (%v) outside valid area (%v)", offset+length, len(pj.Message))
@@ -460,6 +483,17 @@ writeloop:
 			stack = append(stack, stackRoot)
 			continue
 		case TagString:
+			if i.IsRawNumber() {
+				// Preserved number: emit its lexical text verbatim, without quotes.
+				// The bytes were validated as a JSON number during parsing.
+				sb, err := i.StringBytes()
+				if err != nil {
+					return nil, err
+				}
+				dst = append(dst, sb...)
+				tmpBuf = tmpBuf[:0]
+				break
+			}
 			sb, err := i.StringBytes()
 			if err != nil {
 				return nil, err
@@ -748,6 +782,31 @@ func (i *Iter) StringBytes() ([]byte, error) {
 	return i.tape.stringByteAt(i.cur, i.tape.Tape[i.off])
 }
 
+// IsRawNumber reports whether the queued value is a number whose original
+// lexical decimal text was preserved because its field was listed in
+// WithRawNumbers. Such values are stored on the tape as marked strings and are
+// read with RawNumber (or String). Regular Int/Uint/Float access is not
+// available for them since converting to those types would lose the precision
+// the option was set out to keep.
+func (i *Iter) IsRawNumber() bool {
+	return i.t == TagString && i.cur&rawNumberBit != 0
+}
+
+// RawNumber returns the original lexical representation of the queued number
+// exactly as it appeared in the JSON input, provided the field was enabled via
+// WithRawNumbers. It returns an error if the queued value is not a preserved
+// number; use IsRawNumber to check first.
+//
+// The returned text is always a syntactically valid JSON number. Integer,
+// fixed-point decimal and exponential notation are all returned verbatim,
+// including leading/trailing zeros and the original exponent letter case.
+func (i *Iter) RawNumber() (string, error) {
+	if !i.IsRawNumber() {
+		return "", errors.New("value is not a raw number")
+	}
+	return i.String()
+}
+
 // SetString can change a string, int, uint or float with the specified string.
 // Attempting to change other types will return an error.
 func (i *Iter) SetString(v string) error {
@@ -760,6 +819,7 @@ func (i *Iter) SetString(v string) error {
 func (i *Iter) SetStringBytes(v []byte) error {
 	switch i.t {
 	case TagString, TagFloat, TagInteger, TagUint:
+		// A replacement string is an ordinary string; drop any raw-number marker.
 		i.cur = ((uint64(TagString) << JSONTAGOFFSET) | STRINGBUFBIT) | uint64(len(i.tape.Strings.B))
 		i.tape.Tape[i.off-1] = i.cur
 		i.tape.Tape[i.off] = uint64(len(v))

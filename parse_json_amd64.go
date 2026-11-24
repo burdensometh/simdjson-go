@@ -47,6 +47,11 @@ func (pj *internalParsedJson) initialize(size int) {
 	}
 	pj.containingScopeOffset = pj.containingScopeOffset[:0]
 	pj.indexesChan = indexChan{}
+
+	// Reset per-message raw number scope state. The configured field set
+	// (rawNumberFields) is retained for reuse of the parser.
+	pj.rawNumberCurrentKey = ""
+	pj.rawNumberArrays = pj.rawNumberArrays[:0]
 }
 
 func (pj *internalParsedJson) parseMessage(msg []byte, ndjson bool) (err error) {

@@ -121,6 +121,78 @@ func addNumber(buf []byte, pj *ParsedJson) bool {
 	return true
 }
 
+// addRawNumber records the number at buf[idx:] as the exact lexical bytes from
+// the input, stored as a marked string on the tape. The number is fully
+// validated first, so the stored text is always a syntactically valid JSON
+// number. It is copied into the string buffer so it survives reuse of the
+// original message buffer regardless of the WithCopyStrings setting.
+func (pj *internalParsedJson) addRawNumber(buf []byte, idx uint64) bool {
+	if tag, _ := parseNumber(buf[idx:]); tag == 0 {
+		return false
+	}
+	end := idx
+	for end < uint64(len(buf)) && isNumberRune[buf[end]]&isPartOfNumberFlag != 0 {
+		end++
+	}
+	token := buf[idx:end]
+	start := len(pj.Strings.B)
+	pj.Strings.B = append(pj.Strings.B, token...)
+	// Marked string: raw number marker + string-buffer marker + offset,
+	// followed by the token length.
+	pj.Tape = append(pj.Tape,
+		(uint64(TagString)<<JSONTAGOFFSET)|rawNumberBit|STRINGBUFBIT|uint64(start),
+		uint64(len(token)))
+	return true
+}
+
+// rememberRawNumberKey records whether the object key that was just written to
+// the tape is configured for raw number preservation.
+func (pj *internalParsedJson) rememberRawNumberKey() {
+	if len(pj.rawNumberFields) == 0 {
+		pj.rawNumberCurrentKey = ""
+		return
+	}
+	// The two most recent tape entries hold the key string: [tag|offset][length].
+	loc := len(pj.Tape) - 2
+	if loc < 0 {
+		pj.rawNumberCurrentKey = ""
+		return
+	}
+	key, err := pj.stringByteAt(pj.Tape[loc]&JSONVALUEMASK, pj.Tape[loc+1])
+	if err != nil {
+		pj.rawNumberCurrentKey = ""
+		return
+	}
+	if _, ok := pj.rawNumberFields[string(key)]; ok {
+		pj.rawNumberCurrentKey = string(key)
+	} else {
+		pj.rawNumberCurrentKey = ""
+	}
+}
+
+// addObjectValueNumber parses the number that is the value of the current
+// object field. A field enabled via WithRawNumbers keeps the lexical text;
+// every other field goes through the regular numeric path.
+// The caller must have established that rawNumberFields is non-empty.
+func (pj *internalParsedJson) addObjectValueNumber(buf []byte, idx uint64) bool {
+	if pj.rawNumberCurrentKey != "" {
+		pj.rawNumberCurrentKey = ""
+		return pj.addRawNumber(buf, idx)
+	}
+	return addNumber(buf[idx:], &pj.ParsedJson)
+}
+
+// addArrayNumber parses a number element of an array. Numbers inside an array
+// that is itself the value of a raw-number field keep their lexical text;
+// everything else uses the regular numeric path.
+// The caller must have established that rawNumberFields is non-empty.
+func (pj *internalParsedJson) addArrayNumber(buf []byte, idx uint64) bool {
+	if len(pj.rawNumberArrays) > 0 {
+		return pj.addRawNumber(buf, idx)
+	}
+	return addNumber(buf[idx:], &pj.ParsedJson)
+}
+
 func isValidTrueAtom(buf []byte) bool {
 	if len(buf) >= 5 { // fast path when there is enough space left in the buffer
 		const tv = uint32(0x0000000065757274) // "true    "
@@ -245,53 +317,77 @@ object_key_state:
 	if buf[idx] != ':' {
 		goto fail
 	}
+	// Record whether this field is configured for raw number preservation.
+	// Skip entirely when the feature is disabled so the common path is untouched.
+	if len(pj.rawNumberFields) > 0 {
+		pj.rememberRawNumberKey()
+	}
 	if done, idx = updateChar(pj, idx); done {
 		goto succeed
 	}
 	switch buf[idx] {
 	case '"':
+		pj.rawNumberCurrentKey = ""
 		if !parseString(&pj.ParsedJson, idx, peekSize(pj), pj.copyStrings) {
 			goto fail
 		}
 
 	case 't':
+		pj.rawNumberCurrentKey = ""
 		if !isValidTrueAtom(buf[idx:]) {
 			goto fail
 		}
 		pj.write_tape(0, 't')
 
 	case 'f':
+		pj.rawNumberCurrentKey = ""
 		if !isValidFalseAtom(buf[idx:]) {
 			goto fail
 		}
 		pj.write_tape(0, 'f')
 
 	case 'n':
+		pj.rawNumberCurrentKey = ""
 		if !isValidNullAtom(buf[idx:]) {
 			goto fail
 		}
 		pj.write_tape(0, 'n')
 
 	case '-':
-		if !addNumber(buf[idx:], &pj.ParsedJson) {
+		if len(pj.rawNumberFields) > 0 {
+			if !pj.addObjectValueNumber(buf, idx) {
+				goto fail
+			}
+		} else if !addNumber(buf[idx:], &pj.ParsedJson) {
 			goto fail
 		}
 
 	case '{':
+		pj.rawNumberCurrentKey = ""
 		pj.containingScopeOffset = append(pj.containingScopeOffset, (pj.get_current_loc()<<retAddressShift)|retAddressObjectConst)
 		pj.write_tape(0, '{')
 		// we have not yet encountered } so we need to come back for it
 		goto object_begin
 
 	case '[':
+		rawArray := pj.rawNumberCurrentKey != ""
+		pj.rawNumberCurrentKey = ""
 		pj.containingScopeOffset = append(pj.containingScopeOffset, (pj.get_current_loc()<<retAddressShift)|retAddressObjectConst)
 		pj.write_tape(0, '[')
+		if rawArray {
+			// Record the tape index of this '[' so its number elements
+			// keep their lexical text until the array is closed.
+			pj.rawNumberArrays = append(pj.rawNumberArrays, pj.get_current_loc()-1)
+		}
 		// we have not yet encountered } so we need to come back for it
 		goto arrayBegin
-
 	default:
 		if buf[idx] >= '0' && buf[idx] <= '9' {
-			if !addNumber(buf[idx:], &pj.ParsedJson) {
+			if len(pj.rawNumberFields) > 0 {
+				if !pj.addObjectValueNumber(buf, idx) {
+					goto fail
+				}
+			} else if !addNumber(buf[idx:], &pj.ParsedJson) {
 				goto fail
 			}
 			break
@@ -329,6 +425,14 @@ scopeEnd:
 	offset = pj.containingScopeOffset[len(pj.containingScopeOffset)-1]
 	// drop last element
 	pj.containingScopeOffset = pj.containingScopeOffset[:len(pj.containingScopeOffset)-1]
+
+	// If a raw-number array scope is closing, retire its marker.
+	if len(pj.rawNumberFields) > 0 {
+		if n := len(pj.rawNumberArrays); n > 0 &&
+			pj.rawNumberArrays[n-1] == offset>>retAddressShift {
+			pj.rawNumberArrays = pj.rawNumberArrays[:n-1]
+		}
+	}
 
 	pj.write_tape(offset>>retAddressShift, buf[idx])
 	pj.annotate_previousloc(offset>>retAddressShift, pj.get_current_loc())
@@ -380,7 +484,11 @@ mainArraySwitch:
 		/* goto array_continue */
 
 	case '-':
-		if !addNumber(buf[idx:], &pj.ParsedJson) {
+		if len(pj.rawNumberFields) > 0 {
+			if !pj.addArrayNumber(buf, idx) {
+				goto fail
+			}
+		} else if !addNumber(buf[idx:], &pj.ParsedJson) {
 			goto fail
 		}
 
@@ -394,11 +502,19 @@ mainArraySwitch:
 		// we have not yet encountered ] so we need to come back for it
 		pj.containingScopeOffset = append(pj.containingScopeOffset, (pj.get_current_loc()<<retAddressShift)|retAddressArrayConst)
 		pj.write_tape(0, '[') // here the compilers knows what c is so this gets optimized
+		// Nested arrays inherit the raw-number scope of the enclosing array.
+		if len(pj.rawNumberFields) > 0 && len(pj.rawNumberArrays) > 0 {
+			pj.rawNumberArrays = append(pj.rawNumberArrays, pj.get_current_loc()-1)
+		}
 		goto arrayBegin
 
 	default:
 		if buf[idx] >= '0' && buf[idx] <= '9' {
-			if !addNumber(buf[idx:], &pj.ParsedJson) {
+			if len(pj.rawNumberFields) > 0 {
+				if !pj.addArrayNumber(buf, idx) {
+					goto fail
+				}
+			} else if !addNumber(buf[idx:], &pj.ParsedJson) {
 				goto fail
 			}
 			break

@@ -511,6 +511,40 @@ but mandates that the original JSON buffer is kept alive until the `ParsedJson` 
 In case the JSON message buffer is freed earlier (or for streaming use cases where memory is reused)
 `WithCopyStrings(true)` should be used (which is the default behaviour).
 
+### Exact numeric identity with raw numbers
+
+Some numeric identifiers (for example log order ids) can exceed the range of a `uint64`.
+Such values are normally parsed into a `float64`, which only keeps about 15-17 significant
+decimal digits. Two distinct ids that round to the same `float64` therefore collapse into
+the same key, losing their identity.
+
+The opt-in `WithRawNumbers(fields ...string)` parser option keeps the original lexical
+decimal text of the number paired with any of the named object fields (matching is by field
+name, at any nesting depth). Numbers outside objects are never affected, and leaving the
+option out keeps all numeric access (`Int`, `Uint`, `Float`, `Interface`) exactly as before.
+
+```go
+pj, err := simdjson.Parse(input, nil, simdjson.WithRawNumbers("order_id"))
+...
+if elem.Iter.IsRawNumber() {
+    id, err := elem.Iter.RawNumber() // exact text, e.g. "92233720368547758081234"
+}
+```
+
+The preserved text is always a validated JSON number and is returned verbatim regardless of
+notation, so the formatting policy is explicit:
+
+- Integer notation (`92233720368547758081234`) keeps every digit with no float rounding.
+- Fixed-point/decimal notation (`12.340`) is kept character for character, including trailing zeros.
+- Exponential notation (`1.2e3`, `7E-2`) keeps the original mantissa, exponent sign and letter case.
+
+The exact identity is maintained when the batch is written back out: `MarshalJSON` emits the
+lexical text as an unquoted number, and the binary `Serializer` carries the marker through
+serialize/deserialize round trips (on-wire version 4; readers still accept older versions).
+A field whose value is an array preserves every number element in that array, including
+nested arrays. Replacing such a value through `SetString`/`SetInt`/`SetFloat` clears the
+raw marker and turns it back into an ordinary value.
+
 The performance impact differs based on the input type, but this is the general differences:
 
 ```

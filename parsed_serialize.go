@@ -36,7 +36,7 @@ const (
 	stringBits        = 14
 	stringSize        = 1 << stringBits
 	stringmask        = stringSize - 1
-	serializedVersion = 3
+	serializedVersion = 4
 )
 
 // Serializer allows to serialize parsed json and read it back.
@@ -296,6 +296,10 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 				panic(err)
 			}
 			offset := s.indexString(sb)
+			// Preserve the raw-number marker (if any) alongside the offset.
+			if payload&rawNumberBit != 0 {
+				offset |= rawNumberBit
+			}
 
 			binary.LittleEndian.PutUint64(tmp[:], offset)
 			s.valuesBuf = append(s.valuesBuf, tmp[:]...)
@@ -469,8 +473,8 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if v, err := br.ReadByte(); err != nil {
 		return dst, err
 	} else if v > serializedVersion {
-		// v3 reads v2.
-		// v2 reads v1.
+		// Newer versions remain readable when the on-wire layout is unchanged:
+		// v4 reads v3 and earlier; v3 reads v2; v2 reads v1.
 		return dst, errors.New("unknown version")
 	}
 
@@ -608,6 +612,8 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 			sLen := binary.LittleEndian.Uint64(values[8:16])
 			values = values[16:]
 
+			// A v4 stream may carry a raw-number marker on a string. Older
+			// streams never set this bit, so it is simply zero for them.
 			dst.Tape[off] = tagDst | sOffset
 			dst.Tape[off+1] = sLen
 			off += 2
