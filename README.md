@@ -166,6 +166,45 @@ Will locate the field inside a json object with the following structure:
 The values can be any type. The [Element](https://pkg.go.dev/github.com/minio/simdjson-go#Element)
 will contain the element information and an Iter to access the content.
 
+### Filtering records
+
+A [`Filter`](https://pkg.go.dev/github.com/minio/simdjson-go#Filter) is a typed
+predicate over a single record. Filters are built from field selectors, combine
+with `And`, `Or` and `Not`, and can be applied to every record of a `ParsedJson`.
+
+Every evaluation returns a [`MatchResult`](https://pkg.go.dev/github.com/minio/simdjson-go#MatchResult)
+with three distinct outcomes: `Match`, `NoMatch` (the record was fully read and
+does not satisfy the filter) and `MissingField` (a field the filter needs is
+absent, so the record could not be evaluated). Keeping these apart means a
+record with a missing field is never silently folded into "did not match".
+
+```Go
+// Only records whose payment completed and whose amount is at least 100.
+f := simdjson.And(
+	simdjson.Field("payment", "status").String(simdjson.OpEqual, "completed"),
+	simdjson.Field("payment", "amount").Number(simdjson.OpGreaterEqual, 100),
+)
+
+// Count each outcome separately.
+stats, err := pj.CountMatches(f)
+fmt.Println(stats.Matches, stats.NoMatches, stats.MissingFields)
+
+// Write matches to the next stage as NDJSON, in the order of the input.
+stats, err = pj.WriteMatches(w, f)
+```
+
+`Field` takes an object path and never descends into arrays. Comparisons are
+typed: `String`, `Bool`, `Number`, `Int` and `Uint` only match a value of the
+corresponding JSON type. `Number` compares integers and floats by value in
+`float64`; `Int` and `Uint` compare integers exactly and reject floats.
+`Exists()` matches any present value, including `null`.
+
+Filters are evaluated on a copy of the iterator, so a custom `Filter`, a
+`FilterFunc`, or the callback of `ForEachFiltered` can still read the record
+from its start. `ForEachFiltered` reports every record with its result;
+`ForEachMatch` reports only matches. None of these build a `map` for the
+record; the tape is read directly.
+
 ## Parsing Objects
 
 If you are only interested in one key in an object you can use `FindKey` to quickly select it.
