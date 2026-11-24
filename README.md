@@ -270,6 +270,57 @@ func findHondas(r io.Reader) {
 
 More examples can be found in the examples subdirectory and further documentation can be found at [godoc](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc).
 
+## Projecting typed columns
+
+When objects are wide and only a few fields are needed, a [`Projection`](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc#Projection)
+reads selected paths directly into fixed-type columns, skipping everything else on the tape.
+
+Declare each column with an output name, a path and a fixed type, then read a parsed document:
+
+```Go
+cols := []simdjson.Column{
+	{Name: "make", Path: []string{"Make"}, Type: simdjson.ColumnString},
+	{Name: "code", Path: []string{"ViolationCode"}, Type: simdjson.ColumnInt64},
+	{Name: "lat", Path: []string{"Location", "Latitude"}, Type: simdjson.ColumnFloat64},
+}
+p, err := simdjson.NewProjection(cols)
+if err != nil {
+	log.Fatal(err)
+}
+if err := p.Read(parsed); err != nil { // one row per top-level element
+	log.Fatal(err)
+}
+// or: p.ReadArray(parsed) for one row per element of a single top-level array.
+
+for row := 0; row < p.Rows(); row++ {
+	make := p.ColumnByName("make")
+	if make.States[row] == simdjson.FieldOK {
+		fmt.Println(make.Strings[row])
+	}
+}
+```
+
+Each cell carries a [`FieldState`](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc#FieldState),
+which keeps three failure cases distinct from a real value:
+
+| State               | Meaning                                                                 |
+|---------------------|-------------------------------------------------------------------------|
+| `FieldMissing`      | The path was absent, or an intermediate value was not an object.        |
+| `FieldNull`         | The path resolved to an explicit JSON `null`.                           |
+| `FieldTypeMismatch` | The value's JSON type cannot be represented by the declared column type.|
+| `FieldOK`           | The value was extracted.                                                |
+
+Values are column-major: `ColumnData` has exactly one populated typed slice (`Strings`, `Ints`,
+`Uints`, `Floats` or `Bools`), and it is aligned with `States` and with `Projection.Rows()`.
+Cells that are missing, null or mismatched keep their zero value, so positions stay aligned for
+batch writes. Row order is input order; column order is declaration order. Both can be verified
+with `Rows`, `RowStates` and `Columns`. Call `Reset` to reuse the allocated buffers for another batch.
+
+Only object nesting is traversed; arrays are not descended into. The first occurrence of a
+duplicated key wins, matching `Object.FindPath`. Strings are copied by default so a projection
+outlives the `ParsedJson`; disable this with `WithProjectionCopyStrings(false)` when the parsed
+buffers are neither modified nor reused before the strings are consumed.
+
 
 ### In-place Value Replacement
 
