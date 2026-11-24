@@ -19,9 +19,11 @@ package simdjson
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"runtime"
@@ -37,6 +39,12 @@ const (
 	stringSize        = 1 << stringBits
 	stringmask        = stringSize - 1
 	serializedVersion = 3
+
+	// serializedVersionManifest is written instead of serializedVersion
+	// when an integrity manifest is attached to the serialized data.
+	// The payload format is identical to serializedVersion,
+	// with a manifest trailer appended.
+	serializedVersionManifest = 4
 )
 
 // Serializer allows to serialize parsed json and read it back.
@@ -198,6 +206,20 @@ const (
 // Serialize the data in pj and return the data.
 // An optional destination can be provided.
 func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
+	return s.serialize(dst, pj, false)
+}
+
+// SerializeWithManifest serializes the data in pj like Serialize,
+// but appends an integrity manifest trailer to the serialized data.
+// The manifest records the format identifier, the number of root
+// records in the batch and a deterministic digest of the batch content.
+// The manifest is verified before content is returned by
+// Deserialize and DeserializeVerified.
+func (s *Serializer) SerializeWithManifest(dst []byte, pj ParsedJson) []byte {
+	return s.serialize(dst, pj, true)
+}
+
+func (s *Serializer) serialize(dst []byte, pj ParsedJson, withManifest bool) []byte {
 	// Blocks:
 	//  - Compressed size of entire block following. Can be 0 if empty. (varuint)
 	//  - Block type, byte:
@@ -218,6 +240,13 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 	// - Tags Block: Compressed block. See above.
 	// - Uncompressed values size (varuint)
 	// - Values Block: Compressed block. See above.
+	//
+	// If a manifest is attached (version 4), the following trailer is appended:
+	// - Manifest magic "SJMF" (4 bytes)
+	// - Manifest layout version (byte)
+	// - Format identifier (byte)
+	// - Number of root records in the batch (uint64, little endian)
+	// - SHA-256 digest of the uncompressed strings, tags and values sections (32 bytes)
 	//
 	// Reconstruction:
 	//
@@ -255,6 +284,16 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 
 	valWr, valDone := encBlock(s.compValues, s.valuesCompBuf, s.fasterComp)
 	tagWr, tagDone := encBlock(s.compTags, s.tagsCompBuf, s.fasterComp)
+
+	// When a manifest is requested, the uncompressed tags and values
+	// are hashed as they are streamed to the compressors.
+	var tagHash, valHash hash.Hash
+	if withManifest {
+		tagHash = sha256.New()
+		valHash = sha256.New()
+		tagWr = io.MultiWriter(tagWr, tagHash)
+		valWr = io.MultiWriter(valWr, valHash)
+	}
 	// Pessimistically allocate for maximum possible size.
 	if cap(s.tagsBuf) <= tagBufSize {
 		s.tagsBuf = make([]byte, tagBufSize)
@@ -378,7 +417,11 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 	wg.Wait()
 
 	// Version
-	dst = append(dst, serializedVersion)
+	if withManifest {
+		dst = append(dst, serializedVersionManifest)
+	} else {
+		dst = append(dst, serializedVersion)
+	}
 
 	// Size of varints...
 	varInts := binary.PutUvarint(tmp[:], uint64(0)) +
@@ -427,6 +470,18 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 		fmt.Println("strings:", len(pj.Strings.B)+len(pj.Message), "->", len(s.sMsg), "tags:", rawTags, "->", len(s.tagsCompBuf), "values:", rawValues, "->", len(s.valuesCompBuf), "Total:", len(pj.Message)+len(pj.Strings.B)+len(pj.Tape)*8, "->", len(dst))
 	}
 
+	if withManifest {
+		m := Manifest{
+			Format:  serializedVersionManifest,
+			Records: countRecords(pj.Tape),
+			Digest: combineSums(
+				sha256.Sum256(s.stringBuf),
+				sum256(tagHash),
+				sum256(valHash)),
+		}
+		dst = m.appendTo(dst)
+	}
+
 	return dst
 }
 
@@ -461,17 +516,71 @@ func (s *Serializer) splitBlocks(r io.Reader, out chan []byte) error {
 
 // Deserialize the content in src.
 // Only basic sanity checks will be performed.
-// Slight corruption will likely go through unnoticed.
-// And optional destination can be provided.
+// Slight corruption will likely go through unnoticed,
+// unless the content carries an integrity manifest,
+// which is always verified before the content is returned.
+// An optional destination can be provided.
 func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, error) {
+	var info batchInfo
+	pj, err := s.deserialize(src, dst, &info)
+	if err != nil {
+		return pj, err
+	}
+	if info.version == serializedVersionManifest {
+		// A manifest is attached. Verify before serving content.
+		if _, err := s.verifyManifest(pj, &info); err != nil {
+			return pj, err
+		}
+	}
+	return pj, nil
+}
+
+// DeserializeVerified deserializes the content in src and requires
+// that it carries a valid integrity manifest, as attached by
+// SerializeWithManifest. The content is verified against the manifest
+// before it is returned, and the verified manifest is returned as evidence.
+//
+// If the content carries no manifest, an error wrapping ErrManifestMissing
+// is returned. Batches serialized without a manifest (old format) remain
+// explicitly readable with Deserialize.
+// If the manifest does not match the content, an error wrapping
+// ErrManifestMismatch is returned.
+// An optional destination can be provided.
+func (s *Serializer) DeserializeVerified(src []byte, dst *ParsedJson) (*ParsedJson, Manifest, error) {
+	var info batchInfo
+	pj, err := s.deserialize(src, dst, &info)
+	if err != nil {
+		return pj, Manifest{}, err
+	}
+	if info.version != serializedVersionManifest {
+		return pj, Manifest{}, fmt.Errorf("%w: serialized version %d", ErrManifestMissing, info.version)
+	}
+	m, err := s.verifyManifest(pj, &info)
+	if err != nil {
+		return pj, Manifest{}, err
+	}
+	return pj, *m, nil
+}
+
+// batchInfo describes a deserialized batch.
+type batchInfo struct {
+	version byte   // Format version of the batch.
+	trailer []byte // Data trailing the batch, holds the manifest if present.
+}
+
+// deserialize the content in src.
+// Only basic sanity checks are performed.
+// info is filled in on success.
+func (s *Serializer) deserialize(src []byte, dst *ParsedJson, info *batchInfo) (*ParsedJson, error) {
 	br := bytes.NewBuffer(src)
 
 	if v, err := br.ReadByte(); err != nil {
 		return dst, err
-	} else if v > serializedVersion {
-		// v3 reads v2.
-		// v2 reads v1.
+	} else if v > serializedVersionManifest {
+		// v4 reads v1-v3 payloads.
 		return dst, errors.New("unknown version")
+	} else {
+		info.version = v
 	}
 
 	if dst == nil {
@@ -691,7 +800,128 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if stringsErr != nil {
 		return dst, fmt.Errorf("reading strings: %w", stringsErr)
 	}
+	info.trailer = br.Bytes()
 	return dst, nil
+}
+
+const (
+	// manifestMagic identifies an integrity manifest trailer.
+	manifestMagic = "SJMF"
+	// manifestVersion is the version of the manifest layout.
+	manifestVersion = 1
+	// manifestSize is the size of a serialized manifest in bytes:
+	// magic (4) + layout version (1) + format identifier (1) + records (8) + digest (32).
+	manifestSize = 4 + 1 + 1 + 8 + sha256.Size
+)
+
+// ErrManifestMissing is returned (wrapped) when a serialized batch
+// carries no integrity manifest, or the manifest trailer is
+// incomplete or malformed.
+var ErrManifestMissing = errors.New("simdjson: integrity manifest missing")
+
+// ErrManifestMismatch is returned to report that the integrity manifest
+// of a serialized batch does not match the batch content.
+var ErrManifestMismatch = errors.New("simdjson: manifest does not match content")
+
+// Manifest is the integrity evidence of a serialized batch.
+// It allows to prove that the content and the number of records
+// of a batch are unchanged, for instance after migrating storage.
+type Manifest struct {
+	// Format identifies the format of the serialized batch payload.
+	Format byte
+	// Records is the number of root records in the batch.
+	Records uint64
+	// Digest is the deterministic SHA-256 digest of the batch content.
+	// It covers the uncompressed strings, tags and values sections,
+	// so it is independent of the compression mode.
+	Digest [sha256.Size]byte
+}
+
+// String returns a short human-readable representation of the manifest.
+func (m Manifest) String() string {
+	return fmt.Sprintf("format=%d records=%d digest=%x", m.Format, m.Records, m.Digest)
+}
+
+// appendTo appends the serialized manifest to dst.
+func (m *Manifest) appendTo(dst []byte) []byte {
+	var tmp [8]byte
+	dst = append(dst, manifestMagic...)
+	dst = append(dst, manifestVersion, m.Format)
+	binary.LittleEndian.PutUint64(tmp[:], m.Records)
+	dst = append(dst, tmp[:]...)
+	return append(dst, m.Digest[:]...)
+}
+
+// parseManifest parses a manifest from the trailer of a serialized batch.
+func parseManifest(trailer []byte) (*Manifest, error) {
+	if len(trailer) < manifestSize {
+		return nil, fmt.Errorf("%w: trailer is %d bytes, want %d", ErrManifestMissing, len(trailer), manifestSize)
+	}
+	if string(trailer[:4]) != manifestMagic {
+		return nil, fmt.Errorf("%w: invalid magic", ErrManifestMissing)
+	}
+	if trailer[4] != manifestVersion {
+		return nil, fmt.Errorf("%w: unsupported manifest layout version %d", ErrManifestMissing, trailer[4])
+	}
+	m := Manifest{
+		Format:  trailer[5],
+		Records: binary.LittleEndian.Uint64(trailer[6:14]),
+	}
+	copy(m.Digest[:], trailer[14:manifestSize])
+	return &m, nil
+}
+
+// verifyManifest verifies the manifest trailer of a deserialized batch
+// against its decompressed content.
+// pj must be the result of a successful deserialize of the same batch,
+// and the serializer section buffers must be intact.
+func (s *Serializer) verifyManifest(pj *ParsedJson, info *batchInfo) (*Manifest, error) {
+	m, err := parseManifest(info.trailer)
+	if err != nil {
+		return nil, err
+	}
+	if m.Format != info.version {
+		return nil, fmt.Errorf("%w: format identifier: manifest %d, batch %d", ErrManifestMismatch, m.Format, info.version)
+	}
+	// The decompressed sections hold exactly the bytes the manifest covers:
+	// the strings are stored in the message section,
+	// the tags and values in the serializer buffers.
+	digest := combineSums(sha256.Sum256(pj.Message), sha256.Sum256(s.tagsBuf), sha256.Sum256(s.valuesBuf))
+	if digest != m.Digest {
+		return nil, fmt.Errorf("%w: content digest: manifest %x, content %x", ErrManifestMismatch, m.Digest, digest)
+	}
+	if n := countRecords(pj.Tape); n != m.Records {
+		return nil, fmt.Errorf("%w: record count: manifest %d, content %d", ErrManifestMismatch, m.Records, n)
+	}
+	return m, nil
+}
+
+// countRecords returns the number of root records on the tape.
+// Each record is wrapped in a pair of root tags;
+// only the forward-pointing opening root is counted.
+func countRecords(tape []uint64) (n uint64) {
+	for off, entry := range tape {
+		if Tag(entry>>JSONTAGOFFSET) == TagRoot && entry&JSONVALUEMASK > uint64(off) {
+			n++
+		}
+	}
+	return n
+}
+
+// sum256 returns the checksum of h.
+func sum256(h hash.Hash) (sum [sha256.Size]byte) {
+	h.Sum(sum[:0])
+	return sum
+}
+
+// combineSums combines the checksums of the uncompressed
+// strings, tags and values sections into a single content digest.
+func combineSums(strings, tags, values [sha256.Size]byte) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write(strings[:])
+	h.Write(tags[:])
+	h.Write(values[:])
+	return sum256(h)
 }
 
 func (s *Serializer) decBlock(br *bytes.Buffer, dst []byte, wg *sync.WaitGroup, dstErr *error) error {

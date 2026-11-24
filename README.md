@@ -355,6 +355,39 @@ Example of speed for serializer/deserializer on [`parking-citations-1M`](https:/
 
 In some cases the speed difference and compression difference will be bigger.
 
+### Batch integrity manifests
+
+For archived batches it is possible to attach an integrity manifest with
+[`SerializeWithManifest`](https://pkg.go.dev/github.com/minio/simdjson-go#Serializer.SerializeWithManifest).
+The manifest records the format identifier, the number of root records in the batch
+and a deterministic SHA-256 digest of the batch content.
+
+This allows to prove per batch that content and record count are unchanged,
+for instance after migrating storage.
+
+Batches with a manifest are verified before content is returned by
+[`Deserialize`](https://pkg.go.dev/github.com/minio/simdjson-go#Serializer.Deserialize).
+[`DeserializeVerified`](https://pkg.go.dev/github.com/minio/simdjson-go#Serializer.DeserializeVerified)
+additionally requires a manifest to be present and returns it as evidence.
+Batches serialized without a manifest (old format) remain explicitly readable with `Deserialize`.
+
+Verification failures distinguish missing evidence (`ErrManifestMissing`)
+from evidence that does not match the content (`ErrManifestMismatch`):
+
+```Go
+	pj, manifest, err := s.DeserializeVerified(batch, nil)
+	switch {
+	case errors.Is(err, simdjson.ErrManifestMissing):
+		// Batch carries no integrity evidence (old format).
+	case errors.Is(err, simdjson.ErrManifestMismatch):
+		// Evidence does not match the batch content.
+	case err != nil:
+		// Other deserialization error.
+	default:
+		// Content verified. manifest holds the evidence.
+	}
+```
+
 ## Performance vs `encoding/json` and `json-iterator/go`
 
 Though simdjson provides different output than traditional unmarshal functions this can give
