@@ -270,6 +270,85 @@ func findHondas(r io.Reader) {
 
 More examples can be found in the examples subdirectory and further documentation can be found at [godoc](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc).
 
+### Stopping a stream early
+
+`ParseNDStream` runs until the reader is exhausted. When a query only needs a
+sample - for example reading the first few thousand lines of a very large log -
+waiting for the whole file is wasteful, and the caller needs a way to say
+"enough" that also shuts the read side and the parse workers down.
+
+`ParseNDStreamContext` is the cancellable entry point. It blocks until the
+stream is read to the end or its context is canceled, and returns both a
+summary and an error:
+
+```Go
+func countHondasSampled(ctx context.Context, r io.Reader) (int64, error) {
+	var nFound int
+
+	reuse := make(chan *simdjson.ParsedJson, 10)
+	res := make(chan simdjson.Stream, 10)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := simdjson.ParseNDStreamContext(ctx, r, res, reuse)
+		done <- err
+	}()
+
+	// Stop after 1,000 matching records; the parser reports how many
+	// records it had actually delivered by then.
+	var processed int64
+	for got := range res {
+		if got.Error != nil {
+			break
+		}
+		_ = got.Value.ForEach(func(i Iter) error {
+			var elem Element
+			var err error
+			elem, err = i.FindElement(elem, "Make")
+			if err != nil {
+				return nil
+			}
+			bts, _ := elem.Iter.StringBytes()
+			if string(bts) == "HOND" {
+				nFound++
+				if nFound >= 1000 {
+					cancelOnce()
+				}
+			}
+			return nil
+		})
+		select {
+		case reuse <- got.Value:
+		default:
+		}
+	}
+	<-done // returns (processed, context.Canceled)
+	return processed, nil
+}
+```
+
+The number returned is in records, not batches: one batch can hold many
+records. It counts only batches that were actually delivered on `res`.
+Batches that were parsed and queued internally but never delivered at the
+moment of cancellation are dropped and do not count, so the number always
+matches what the caller could observe on `res`. A batch that reached `res`
+is counted in full even if the caller has not inspected it yet.
+
+On cancellation the call stops reading, stops starting new parse work, waits
+for the parse workers already running and closes `res`. The read side stops
+issuing reads at the next batch boundary; a `Read` already blocked in the
+underlying reader cannot be interrupted, but no new one is started. The
+stream ends without an `io.EOF` value and the error is `ctx.Err()`.
+
+The `reuse` channel is bidirectional here. Parsed objects borrowed for
+batches that are dropped are handed back before the call returns, so a caller
+that stops early gets its batch objects back. Returning a value never blocks;
+if `reuse` is full the object is released to the garbage collector after its
+input buffer has been recycled.
+
+A normal read to the end is unchanged: batches arrive in input order, the
+last value on `res` is `io.EOF`, `res` is closed and the error is `nil`.
+
 
 ### In-place Value Replacement
 

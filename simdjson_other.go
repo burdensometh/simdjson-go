@@ -20,6 +20,7 @@
 package simdjson
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -73,4 +74,19 @@ func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
 		close(res)
 	}()
 	return
+}
+
+// ParseNDStreamContext is the cancellable variant of ParseNDStream.
+//
+// It is not available on this platform; it reports the same "Unsupported
+// platform" error as ParseNDStream and returns without processing records.
+func ParseNDStreamContext(ctx context.Context, r io.Reader, res chan<- Stream, reuse chan *ParsedJson) (int64, error) {
+	err := fmt.Errorf("Unsupported platform")
+	select {
+	case res <- Stream{Value: nil, Error: err}:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	close(res)
+	return 0, err
 }
