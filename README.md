@@ -270,6 +270,70 @@ func findHondas(r io.Reader) {
 
 More examples can be found in the examples subdirectory and further documentation can be found at [godoc](https://pkg.go.dev/github.com/minio/simdjson-go?tab=doc).
 
+### Resumable NDJSON processing
+
+`ParseNDStream` parses the input it is given, so restarting it on the same file
+starts over and re-emits records. To process a large NDJSON file across restarts,
+use `OpenNDJSON`, which persists progress and only advances it once a line has
+been acknowledged.
+
+An `NDJSONCheckpoint` records the input identity (name, size, a hash of the
+leading bytes, and a hash of the bytes just before the offset) together with the
+offset of the first unconsumed line and the number of committed records. The
+offset always lies on a complete-line boundary.
+
+```Go
+cpPath := "progress.json"
+var cp *simdjson.NDJSONCheckpoint
+if saved, err := simdjson.LoadCheckpointFile(cpPath); err == nil {
+	cp = &saved
+}
+
+r, err := simdjson.OpenNDJSON("events.ndjson", cp)
+if err != nil {
+	// Includes simdjson.ErrCheckpointMismatch (different file or contents)
+	// and simdjson.ErrCheckpointMidLine (offset is not on a line boundary).
+	log.Fatal(err)
+}
+defer r.Close()
+
+for {
+	line, err := r.Next()
+	if err == io.EOF {
+		break
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Write the record to your output first...
+	if _, err := sink.Write(append(line, '\n')); err != nil {
+		log.Fatal(err)
+	}
+
+	// ...then acknowledge it. Only committed lines advance the checkpoint,
+	// so a crash before Commit re-reads the line instead of losing it.
+	if err := r.Commit(); err != nil {
+		log.Fatal(err)
+	}
+	if err := r.SaveCheckpointFile(cpPath); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`NextParsed` parses the line with `Parse` and returns the `*ParsedJson`; the line
+is still only acknowledged by `Commit`.
+
+If the input is replaced, truncated, or modified before the checkpoint offset,
+`OpenNDJSON` fails with `ErrCheckpointMismatch` rather than silently continuing
+at the wrong place. A checkpoint may be for a file that has since grown (for
+example a daily file still being written); processing continues from the
+committed offset. If the final committed record had no trailing newline and the
+file later grows, the missing terminator is consumed instead of re-emitting the
+record; if the appended data does not start with a terminator, reopening fails
+with `ErrCheckpointMidLine`.
+
 
 ### In-place Value Replacement
 
