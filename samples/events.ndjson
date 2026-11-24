@@ -1,0 +1,9 @@
+{"schema_version":"v1","event":{"event_id":"E-1001","time":"2026-11-20T10:15:30Z"},"payment":{"amount":120.50}}
+{"schema_version":"v2","event_id":"E-2002","biz_time":"2026-11-20T11:20:45Z","amount":88.00}
+{"schema_version":"v1","event":{"event_id":"E-1003","time":"2026-11-21T09:00:00Z"},"payment":{"amount":300},"amount":315.75,"biz_time":"2026-11-21T09:05:00Z"}
+{"schema_version":"v2","event_id":"E-2004","biz_time":"2026-11-21T14:30:00Z","amount":42.10,"event":{"event_id":"E-2004-LEGACY","time":"2026-11-21T14:00:00Z"},"payment":{"amount":40.00}}
+{"event":{"event_id":"E-9005","time":"2026-11-22T08:00:00Z"},"payment":{"amount":9.99}}
+{"schema_version":"v3","event_id":"E-9006","biz_time":"2026-11-22T08:10:00Z","amount":1.0}
+{"schema_version":"v1","event":{"event_id":"E-1007","time":"not-a-timestamp"},"payment":{"amount":"55.25"}}
+{"schema_version":"v2","event_id":"E-2008","biz_time":"2026-11-22T18:45:00Z"}
+{"schema_version":1,"event":{"event_id":"E-1009","time":"2026-11-23T07:07:07Z"},"payment":{"amount":"77.7"}}
