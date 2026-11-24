@@ -197,6 +197,90 @@ method to get an iterator.
 There are methods that allow you to retrieve all elements as a single type,
 []int64, []uint64, []float64 and []string with AsInteger(), AsUint64(), AsFloat() and AsString().
 
+## Expanding arrays into rows
+
+A common reporting shape is a document per event holding a nested array of
+records, where each record must become its own output row while still knowing
+which event and which array element it came from:
+
+```JSON
+{"order":"A-1","items":[{"sku":"a","qty":1},{"sku":"b","qty":2}]}
+{"order":"A-2","items":[]}
+```
+
+[`ParsedJson.Expand`](https://pkg.go.dev/github.com/minio/simdjson-go#ParsedJson.Expand)
+(and `Object.Expand` / `Array.Expand`) expands a named array into a slice of
+[`Row`](https://pkg.go.dev/github.com/minio/simdjson-go#Row), one per element:
+
+```Go
+pj, err := simdjson.ParseND(ndjson, nil)
+if err != nil {
+	log.Fatal(err)
+}
+
+rows, err := pj.Expand(nil, []string{"items"}, simdjson.ExpandItemType(simdjson.TypeObject))
+if err != nil {
+	log.Fatal(err)
+}
+for _, r := range rows {
+	parent, _ := r.Parent.Object(nil)
+	order := ""
+	if e := parent.FindKey("order", nil); e != nil {
+		order, _ = e.Iter.String()
+	}
+	item, _ := r.Item.Interface()
+	fmt.Printf("%s order=%s item=%v\n", r.Location(), order, item)
+	// event[0].items[0] order=A-1 item=map[qty:1 sku:a]
+	// event[0].items[1] order=A-1 item=map[qty:2 sku:b]
+}
+```
+
+Each `Row` records:
+
+* `ParentKey` - the object key of the expanded array (`"items"`).
+* `EventIndex` - the zero-based index of the root element (the event) it came
+  from. For NDJSON this is the line number; a single-document parse is 0.
+* `ItemIndex` - the zero-based index of the array element. It is `-1` for a
+  parent-only row (see below).
+* `Parent` - an `Iter` at the container object, so `r.Parent.Object(nil)` /
+  `FindKey` can read the other fields of the event (`"order"` above).
+* `Item` - an `Iter` at the array element.
+* `Err` - set for a bad item.
+
+### Empty arrays
+
+By default an empty array produces no rows, matching an inner join. Pass
+`ExpandKeepEmptyParent(true)` to keep the event as a single row with
+`ItemIndex == -1`; its `Item` then holds the empty array. The same option also
+keeps events where the key is missing or `null`, so a report does not silently
+drop orders without items.
+
+### Bad items
+
+When a value does not have the expected type, expansion does not abort and
+does not silently drop it. Instead a row with `Err` set is emitted for the
+exact location. The error is a
+[`*BadItem`](https://pkg.go.dev/github.com/minio/simdjson-go#BadItem) carrying
+the parent key, event index, item index, the expected and found type, and a
+short value preview. `Row.Bad()`, `Row.BadItem()` and `Row.Location()` make
+them easy to report:
+
+```Go
+rows, _ := pj.Expand(nil, []string{"items"}, simdjson.ExpandItemType(simdjson.TypeObject))
+for _, r := range rows {
+	if r.Bad() {
+		fmt.Println(r.BadItem().Error())
+		// simdjson: bad item at event[2].items[1]: got int, want object (7)
+		continue
+	}
+	// use r.Item and r.Parent
+}
+```
+
+`ExpandEach` is the streaming variant: instead of collecting rows it calls a
+callback for each row, so a large report can be written without materializing
+every row.
+
 ## Number parsing
 
 Numbers in JSON are untyped and are returned by the following rules in order:
